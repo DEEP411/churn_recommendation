@@ -1,16 +1,21 @@
-"""Train churn prediction models.
+"""Train churn prediction models on the IBM Telco Customer Churn dataset.
 
-This script generates a synthetic customer churn dataset, trains three
-classifiers (logistic regression, random forest, and XGBoost) using
-scikit‑learn and XGBoost, evaluates them on a hold‑out test set,
-and reports the F1‑score for each model.  It also saves the trained
-models and the dataset for future use.
+This script loads the public IBM Telco Customer Churn dataset (7,043 real
+customers, data/Telco-Customer-Churn.csv), encodes categorical features,
+trains three classifiers (logistic regression, random forest, and XGBoost)
+using scikit-learn and XGBoost, evaluates them on a hold-out test set, and
+reports the F1-score and ROC-AUC for each model. It also saves the trained
+models and per-model metrics for future use.
+
+Dataset source:
+    https://github.com/IBM/telco-customer-churn-on-icp4d
+    (IBM sample telecom dataset, released for public analytics use)
 
 Usage:
     python train_churn.py
 
 Dependencies:
-    numpy, pandas, scikit‑learn
+    numpy, pandas, scikit-learn, xgboost
 """
 
 import os
@@ -18,143 +23,129 @@ import pickle
 
 import numpy as np
 import pandas as pd
-from sklearn.datasets import make_classification
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier  # XGBoost implementation
-from sklearn.metrics import f1_score
+from xgboost import XGBClassifier
+from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+DATA_PATH = os.path.join('data', 'Telco-Customer-Churn.csv')
 
 
-def generate_synthetic_data(n_samples: int = 1000, n_features: int = 20, seed: int = 42):
-    """Generate a synthetic binary classification dataset for churn prediction.
+def load_real_data(path: str = DATA_PATH) -> pd.DataFrame:
+    """Load and clean the real Telco Customer Churn dataset.
 
     Args:
-        n_samples (int): Number of samples to generate.
-        n_features (int): Number of features.
-        seed (int): Random seed for reproducibility.
+        path (str): Path to the Telco-Customer-Churn.csv file.
 
     Returns:
-        X (np.ndarray): Feature matrix of shape (n_samples, n_features).
-        y (np.ndarray): Binary labels (0 = stay, 1 = churn).
+        pd.DataFrame: Cleaned dataframe ready for feature encoding.
     """
-    X, y = make_classification(
-        n_samples=n_samples,
-        n_features=n_features,
-        n_informative=int(n_features * 0.6),
-        n_redundant=int(n_features * 0.2),
-        n_clusters_per_class=2,
-        weights=[0.7, 0.3],
-        random_state=seed,
-    )
-    return X, y
+    df = pd.read_csv(path)
+    df = df.drop(columns=['customerID'])
+    # TotalCharges has a handful of blank strings for brand-new customers; treat as 0 tenure spend
+    df['TotalCharges'] = pd.to_numeric(df['TotalCharges'], errors='coerce').fillna(0.0)
+    df['Churn'] = (df['Churn'] == 'Yes').astype(int)
+    return df
 
 
-def save_dataset(X: np.ndarray, y: np.ndarray, out_path: str) -> None:
-    """Save the synthetic dataset to a CSV file.
-
-    The output CSV will contain numeric columns for each feature and a
-    `churn` column for the target variable.
+def encode_features(df: pd.DataFrame):
+    """One-hot encode categorical columns and scale numeric columns.
 
     Args:
+        df (pd.DataFrame): Cleaned Telco dataframe including the `Churn` target.
+
+    Returns:
         X (np.ndarray): Feature matrix.
-        y (np.ndarray): Target vector.
-        out_path (str): File path to save the CSV.
+        y (np.ndarray): Binary churn labels.
+        feature_names (list): Column names in X, in order.
     """
-    df = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(X.shape[1])])
-    df['churn'] = y
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    df.to_csv(out_path, index=False)
-    print(f"Synthetic dataset saved to {out_path}")
+    y = df['Churn'].values
+    X_df = df.drop(columns=['Churn'])
+
+    numeric_cols = ['tenure', 'MonthlyCharges', 'TotalCharges']
+    categorical_cols = [c for c in X_df.columns if c not in numeric_cols]
+
+    X_encoded = pd.get_dummies(X_df, columns=categorical_cols, drop_first=True)
+    X_encoded[numeric_cols] = StandardScaler().fit_transform(X_encoded[numeric_cols])
+
+    return X_encoded.values.astype(float), y, list(X_encoded.columns)
 
 
 def train_models(X: np.ndarray, y: np.ndarray):
-    """Train logistic regression and random forest classifiers on the data.
+    """Train logistic regression, random forest, and XGBoost classifiers.
 
     Args:
         X (np.ndarray): Feature matrix.
         y (np.ndarray): Binary labels.
 
     Returns:
-        results (dict): Mapping of model name to (model_object, f1_score).
+        results (dict): Mapping of model name to (model_object, f1_score, roc_auc).
     """
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=0, stratify=y)
 
     results = {}
 
-    # Logistic Regression
-    log_reg = LogisticRegression(max_iter=1000)
+    log_reg = LogisticRegression(max_iter=1000, class_weight='balanced')
     log_reg.fit(X_train, y_train)
     y_pred_lr = log_reg.predict(X_test)
-    f1_lr = f1_score(y_test, y_pred_lr)
-    results['logistic_regression'] = (log_reg, f1_lr)
+    y_prob_lr = log_reg.predict_proba(X_test)[:, 1]
+    results['logistic_regression'] = (log_reg, f1_score(y_test, y_pred_lr), roc_auc_score(y_test, y_prob_lr))
 
-    # Random Forest (baseline)
-    rf = RandomForestClassifier(n_estimators=100, random_state=0)
+    rf = RandomForestClassifier(n_estimators=300, max_depth=8, class_weight='balanced', random_state=0)
     rf.fit(X_train, y_train)
     y_pred_rf = rf.predict(X_test)
-    f1_rf = f1_score(y_test, y_pred_rf)
-    results['random_forest'] = (rf, f1_rf)
+    y_prob_rf = rf.predict_proba(X_test)[:, 1]
+    results['random_forest'] = (rf, f1_score(y_test, y_pred_rf), roc_auc_score(y_test, y_prob_rf))
 
-    # XGBoost classifier (gradient boosted trees)
-    # Use a moderate number of estimators and balanced scale_pos_weight to handle class imbalance.
+    scale_pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
     xgb = XGBClassifier(
-        n_estimators=200,
-        learning_rate=0.1,
+        n_estimators=300,
+        learning_rate=0.05,
         max_depth=4,
         subsample=0.8,
         colsample_bytree=0.8,
         reg_lambda=1.0,
         eval_metric='logloss',
-        random_state=0
+        scale_pos_weight=scale_pos_weight,
+        random_state=0,
     )
     xgb.fit(X_train, y_train)
     y_pred_xgb = xgb.predict(X_test)
-    f1_xgb = f1_score(y_test, y_pred_xgb)
-    results['xgboost'] = (xgb, f1_xgb)
+    y_prob_xgb = xgb.predict_proba(X_test)[:, 1]
+    results['xgboost'] = (xgb, f1_score(y_test, y_pred_xgb), roc_auc_score(y_test, y_prob_xgb))
 
     return results
 
 
 def save_model(model, model_path: str) -> None:
-    """Persist the trained model to disk using pickle.
-
-    Args:
-        model: Trained model object.
-        model_path (str): File path to save the model.
-    """
+    """Persist a trained model to disk using pickle."""
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
     print(f"Model saved to {model_path}")
 
 
 def main():
-    # Generate synthetic data
-    X, y = generate_synthetic_data(n_samples=2000, n_features=20, seed=42)
+    df = load_real_data()
+    X, y, feature_names = encode_features(df)
+    print(f"Loaded {len(df)} real customers, {y.sum()} churned ({y.mean():.1%} churn rate)")
 
-    # Save dataset
-    data_file = os.path.join('data', 'churn_data.csv')
-    save_dataset(X, y, data_file)
-
-    # Train models
     results = train_models(X, y)
 
-    # Save models and print F1 scores
     metrics = []
     model_dir = os.path.join('models')
     os.makedirs(model_dir, exist_ok=True)
-    for name, (model, f1) in results.items():
+    for name, (model, f1, auc) in results.items():
         model_file = os.path.join(model_dir, f'{name}_model.pkl')
         save_model(model, model_file)
-        metrics.append((name, f1))
-    
-    # Display metrics
-    print("\nModel performance (F1‑score):")
-    for name, f1 in metrics:
-        print(f"  {name}: {f1:.3f}")
+        metrics.append((name, f1, auc))
 
-    # Save metrics to CSV for dashboarding
-    metrics_df = pd.DataFrame(metrics, columns=['model', 'f1_score'])
+    print("\nModel performance on the real Telco Customer Churn test set:")
+    for name, f1, auc in metrics:
+        print(f"  {name:<20} F1={f1:.3f}  ROC-AUC={auc:.3f}")
+
+    metrics_df = pd.DataFrame(metrics, columns=['model', 'f1_score', 'roc_auc'])
     metrics_df.to_csv('model_metrics.csv', index=False)
     print("Metrics saved to model_metrics.csv")
 
